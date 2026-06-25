@@ -130,8 +130,8 @@ Example output:
       const content = resData.message?.content;
       if (!content) throw new Error('Empty response from Ollama model');
 
-      const parsed = JSON.parse(content);
-      const translatedChunk = parsed.translations;
+      const parsed = cleanAndParseJSON(content, chunkTexts.length);
+      const translatedChunk = Array.isArray(parsed) ? parsed : (parsed.translations || Object.values(parsed)[0]);
 
       if (!Array.isArray(translatedChunk)) {
         throw new Error('Ollama model did not return a valid "translations" array');
@@ -231,13 +231,8 @@ ${JSON.stringify(chunkTexts)}`;
       const textResponse = resData.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!textResponse) throw new Error('Empty response from Gemini API');
 
-      let translatedChunk;
-      try {
-        translatedChunk = JSON.parse(textResponse.trim());
-      } catch (parseErr) {
-        const cleanText = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
-        translatedChunk = JSON.parse(cleanText);
-      }
+      const parsed = cleanAndParseJSON(textResponse, chunkTexts.length);
+      const translatedChunk = Array.isArray(parsed) ? parsed : (parsed.translations || Object.values(parsed)[0]);
 
       if (!Array.isArray(translatedChunk)) {
         throw new Error('Gemini did not return an array as requested');
@@ -310,8 +305,8 @@ async function translateOpenAIBatch(texts, src, tgt, apiKey, model = 'gpt-4o-min
       const content = resData.choices?.[0]?.message?.content;
       if (!content) throw new Error('Empty response from OpenAI API');
 
-      const parsed = JSON.parse(content);
-      const translatedChunk = Array.isArray(parsed) ? parsed : Object.values(parsed)[0];
+      const parsed = cleanAndParseJSON(content, chunkTexts.length);
+      const translatedChunk = Array.isArray(parsed) ? parsed : (parsed.translations || Object.values(parsed)[0]);
 
       if (!Array.isArray(translatedChunk)) {
         throw new Error('OpenAI did not return an array');
@@ -584,4 +579,157 @@ export async function translateTexts({
   }
 
   throw new Error(`Unknown translation provider: ${provider}`);
+}
+
+/**
+ * Cleans and robustly parses JSON responses from LLMs, handling unescaped quotes and formatting errors.
+ */
+export function cleanAndParseJSON(str, expectedCount) {
+  let clean = str.trim();
+  if (clean.startsWith('```')) {
+    clean = clean.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/, '').trim();
+  }
+
+  // Try normal JSON parsing first
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    console.warn("Standard JSON.parse failed, attempting to repair:", e);
+  }
+
+  // Attempt to repair unescaped quotes inside JSON strings
+  try {
+    const repaired = repairJsonStrings(clean);
+    return JSON.parse(repaired);
+  } catch (e2) {
+    console.warn("Repair attempt failed, using regex extraction fallback:", e2);
+  }
+
+  // Regex extraction fallback
+  try {
+    const extracted = extractStringsFromInvalidJson(clean, expectedCount);
+    if (extracted && extracted.length > 0) {
+      return extracted;
+    }
+  } catch (e3) {
+    console.error("Regex extraction failed:", e3);
+  }
+
+  // If everything failed, throw the original JSON parse error
+  return JSON.parse(clean);
+}
+
+function repairJsonStrings(jsonStr) {
+  let result = '';
+  let insideString = false;
+  
+  for (let i = 0; i < jsonStr.length; i++) {
+    const char = jsonStr[i];
+    
+    if (insideString) {
+      if (char === '\\') {
+        result += char;
+        if (i + 1 < jsonStr.length) {
+          result += jsonStr[i + 1];
+          i++;
+        }
+      } else if (char === '"') {
+        let nextNonWs = '';
+        for (let j = i + 1; j < jsonStr.length; j++) {
+          if (!/\s/.test(jsonStr[j])) {
+            nextNonWs = jsonStr[j];
+            break;
+          }
+        }
+        
+        if (nextNonWs === ',' || nextNonWs === ']' || nextNonWs === '}' || nextNonWs === ':') {
+          insideString = false;
+          result += char;
+        } else {
+          result += '\\"';
+        }
+      } else {
+        result += char;
+      }
+    } else {
+      if (char === '"') {
+        insideString = true;
+        result += char;
+      } else {
+        result += char;
+      }
+    }
+  }
+  return result;
+}
+
+function extractStringsFromInvalidJson(jsonStr, expectedCount) {
+  const startIdx = jsonStr.indexOf('[');
+  const endIdx = jsonStr.lastIndexOf(']');
+  
+  let targetText = jsonStr;
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    targetText = jsonStr.slice(startIdx + 1, endIdx);
+  }
+  
+  const matches = [];
+  const regex = /"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+  let match;
+  
+  while ((match = regex.exec(targetText)) !== null) {
+    const matchIndex = match.index;
+    const matchLength = match[0].length;
+    
+    let isKey = false;
+    for (let i = matchIndex + matchLength; i < targetText.length; i++) {
+      if (/\s/.test(targetText[i])) continue;
+      if (targetText[i] === ':') {
+        isKey = true;
+      }
+      break;
+    }
+    
+    if (!isKey) {
+      let val = match[1];
+      try {
+        val = JSON.parse(`"${val}"`);
+      } catch (e) {
+        val = val.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      }
+      matches.push(val);
+    }
+  }
+  
+  // If the count doesn't match expectedCount, try full text extraction
+  if (expectedCount && matches.length !== expectedCount && targetText !== jsonStr) {
+    const fullMatches = [];
+    const fullRegex = /"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+    let fullMatch;
+    while ((fullMatch = fullRegex.exec(jsonStr)) !== null) {
+      const idx = fullMatch.index;
+      const len = fullMatch[0].length;
+      let isKey = false;
+      for (let i = idx + len; i < jsonStr.length; i++) {
+        if (/\s/.test(jsonStr[i])) continue;
+        if (jsonStr[i] === ':') {
+          isKey = true;
+        }
+        break;
+      }
+      if (!isKey) {
+        let val = fullMatch[1];
+        try {
+          val = JSON.parse(`"${val}"`);
+        } catch (e) {
+          val = val.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        }
+        fullMatches.push(val);
+      }
+    }
+    if (fullMatches.length === expectedCount) {
+      return fullMatches;
+    }
+  }
+  
+  return matches;
 }
