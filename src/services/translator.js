@@ -99,9 +99,13 @@ async function translateOllamaBatch(texts, src, tgt, modelName, url = 'http://lo
           messages: [
             {
               role: 'system',
-              content: `You are a professional translator. Translate the input JSON array of strings from "${src}" to "${tgt}".
-Return ONLY a valid JSON object containing the translations as a JSON array of strings under the key "translations".
-Do not write explanations, greetings, or markdown code block formatting. Only output the raw JSON object.
+              content: `You are a professional translator specialized in technical education and higher vocational training (Ciclo Formativo de Grado Superior).
+Translate the input JSON array of strings from "${src}" to "${tgt}".
+
+Strict Rules:
+1. TONE: Use a clear, direct, pedagogical and professional tone in Spanish. Address the student naturally (e.g., using "crea", "analiza" or neutral infinitive).
+2. TECHNICAL JARGON: Keep industry-standard technical terms in English when appropriate, or add the translation alongside (e.g. "despliegue (deployment)", "enrutador (router)"). Do not translate terms that are universally used in English in the professional field.
+3. FORMAT: Return ONLY a valid JSON object containing the translations as a JSON array of strings under the key "translations". Do not write explanations, greetings, or markdown formatting.
 
 Example output:
 {
@@ -398,6 +402,7 @@ export async function translateTexts({
   provider,
   apiKey,
   ollamaModel, // Model name selected for Ollama (e.g. qwen2.5:7b)
+  ollamaUrl,
   onProgress,
   onModelProgress
 }) {
@@ -424,7 +429,7 @@ export async function translateTexts({
 
     for (const chunk of chunks) {
       const chunkTexts = chunk.map(i => i.text);
-      const translated = await translateOllamaBatch(chunkTexts, src, tgt, ollamaModel || 'qwen2.5:7b');
+      const translated = await translateOllamaBatch(chunkTexts, src, tgt, ollamaModel || 'qwen2.5:7b', ollamaUrl);
       chunk.forEach((item, idx) => {
         resultTemplate[item.index] = translated[idx];
       });

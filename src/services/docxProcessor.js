@@ -12,6 +12,7 @@ export async function translateDocxFile({
   provider,
   apiKey,
   ollamaModel,
+  ollamaUrl,
   onProgress,
   onModelProgress
 }) {
@@ -91,6 +92,7 @@ export async function translateDocxFile({
       provider,
       apiKey,
       ollamaModel,
+      ollamaUrl,
       onProgress,
       onModelProgress
     });

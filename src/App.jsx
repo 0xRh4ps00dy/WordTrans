@@ -217,6 +217,7 @@ export default function App() {
         provider,
         apiKey: apiKeys[provider],
         ollamaModel: selectedOllamaModel,
+        ollamaUrl,
         onProgress: (current, total) => {
           setStatus('translating');
           const percent = Math.round((current / total) * 100);
