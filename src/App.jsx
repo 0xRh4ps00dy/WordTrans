@@ -17,7 +17,9 @@ import {
   Zap,
   Globe,
   Database,
-  ShieldCheck
+  ShieldCheck,
+  Trash2,
+  Play
 } from 'lucide-react';
 import { translateDocxFile } from './services/docxProcessor';
 import { checkOllamaStatus, getOllamaModels } from './services/translator';
@@ -48,8 +50,10 @@ const PROVIDERS = [
 ];
 
 export default function App() {
-  // File states
-  const [file, setFile] = useState(null);
+  // Queue state: array of objects representing files to be translated
+  // { id, file, status, progressPercent, progressDetails, errorMsg, translatedBlob, downloadName }
+  const [queue, setQueue] = useState([]);
+  const [isTranslatingAll, setIsTranslatingAll] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
   
   // Translation config states
@@ -68,13 +72,9 @@ export default function App() {
   const [ollamaModels, setOllamaModels] = useState([]);
   const [selectedOllamaModel, setSelectedOllamaModel] = useState('');
 
-  // Processing states
+  // Overall status of the batch process: 'idle', 'processing', 'completed'
   const [status, setStatus] = useState('idle');
   const [errorMsg, setErrorMsg] = useState('');
-  const [progressPercent, setProgressPercent] = useState(0);
-  const [progressDetails, setProgressDetails] = useState('');
-  const [translatedBlob, setTranslatedBlob] = useState(null);
-  const [downloadName, setDownloadName] = useState('');
 
   // Local model download tracking (for transformers.js)
   const [modelFiles, setModelFiles] = useState({});
@@ -147,32 +147,65 @@ export default function App() {
     }
   };
 
+  const addFilesToQueue = (fileList) => {
+    const newItems = [];
+    const invalidFiles = [];
+    
+    for (let i = 0; i < fileList.length; i++) {
+      const f = fileList[i];
+      if (f.name.endsWith('.docx')) {
+        newItems.push({
+          id: Date.now() + i + Math.random(),
+          file: f,
+          status: 'pending',
+          progressPercent: 0,
+          progressDetails: 'En espera...',
+          errorMsg: '',
+          translatedBlob: null,
+          downloadName: ''
+        });
+      } else {
+        invalidFiles.push(f.name);
+      }
+    }
+
+    if (newItems.length > 0) {
+      setQueue(prev => [...prev, ...newItems]);
+      setStatus('idle');
+      setErrorMsg('');
+    }
+
+    if (invalidFiles.length > 0) {
+      setErrorMsg(`Algunos archivos no son .docx válidos: ${invalidFiles.join(', ')}`);
+    }
+  };
+
   const handleDrop = (e) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragActive(false);
 
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      const droppedFile = e.dataTransfer.files[0];
-      if (droppedFile.name.endsWith('.docx')) {
-        setFile(droppedFile);
-        setErrorMsg('');
-      } else {
-        setErrorMsg('Por favor, selecciona un documento de Word válido (.docx)');
-      }
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      addFilesToQueue(e.dataTransfer.files);
     }
   };
 
   const handleFileChange = (e) => {
-    if (e.target.files && e.target.files[0]) {
-      const selectedFile = e.target.files[0];
-      if (selectedFile.name.endsWith('.docx')) {
-        setFile(selectedFile);
-        setErrorMsg('');
-      } else {
-        setErrorMsg('Por favor, selecciona un documento de Word válido (.docx)');
-      }
+    if (e.target.files && e.target.files.length > 0) {
+      addFilesToQueue(e.target.files);
     }
+  };
+
+  const handleRemoveFromQueue = (id) => {
+    if (isTranslatingAll) return;
+    setQueue(prev => prev.filter(item => item.id !== id));
+  };
+
+  const handleClearQueue = () => {
+    if (isTranslatingAll) return;
+    setQueue([]);
+    setStatus('idle');
+    setErrorMsg('');
   };
 
   const handleSwapLanguages = () => {
@@ -182,9 +215,10 @@ export default function App() {
     setTgtLang(temp);
   };
 
-  // Run translation
+  // Run translation on all pending files in the queue sequentially
   const handleTranslate = async () => {
-    if (!file) return;
+    const pendingItems = queue.filter(item => item.status === 'pending' || item.status === 'error');
+    if (pendingItems.length === 0) return;
 
     const selectedProvider = PROVIDERS.find(p => p.id === provider);
     if (selectedProvider.needsKey && !apiKeys[provider]) {
@@ -203,91 +237,127 @@ export default function App() {
       }
     }
 
-    setStatus('preparing');
-    setProgressPercent(0);
-    setProgressDetails('Preparando archivo y analizando estructura XML...');
+    setIsTranslatingAll(true);
+    setStatus('processing');
     setErrorMsg('');
     setModelFiles({});
 
-    try {
-      const resultBlob = await translateDocxFile({
-        file,
-        src: srcLang,
-        tgt: tgtLang,
-        provider,
-        apiKey: apiKeys[provider],
-        ollamaModel: selectedOllamaModel,
-        ollamaUrl,
-        onProgress: (current, total) => {
-          setStatus('translating');
-          const percent = Math.round((current / total) * 100);
-          setProgressPercent(percent);
-          setProgressDetails(`Traduciendo fragmentos de texto: ${current} de ${total} (${percent}%)`);
-        },
-        onModelProgress: (data) => {
-          setStatus('model_loading');
-          if (data.status === 'progress') {
-            setModelFiles(prev => ({
-              ...prev,
-              [data.file]: {
-                progress: data.progress,
-                loaded: data.loaded,
-                total: data.total
-              }
-            }));
-          } else if (data.status === 'ready') {
-            setProgressDetails('Modelo Web cargado. Iniciando traducción...');
+    // Loop through each pending item
+    for (const item of pendingItems) {
+      // Update status to preparing
+      setQueue(prev => prev.map(qItem => 
+        qItem.id === item.id 
+          ? { ...qItem, status: 'preparing', progressPercent: 0, progressDetails: 'Preparando archivo y analizando estructura XML...' }
+          : qItem
+      ));
+
+      try {
+        const resultBlob = await translateDocxFile({
+          file: item.file,
+          src: srcLang,
+          tgt: tgtLang,
+          provider,
+          apiKey: apiKeys[provider],
+          ollamaModel: selectedOllamaModel,
+          ollamaUrl,
+          onProgress: (current, total) => {
+            const percent = Math.round((current / total) * 100);
+            setQueue(prev => prev.map(qItem => 
+              qItem.id === item.id 
+                ? { ...qItem, status: 'translating', progressPercent: percent, progressDetails: `Traduciendo: ${current} de ${total} (${percent}%)` }
+                : qItem
+            ));
+          },
+          onModelProgress: (data) => {
+            if (data.status === 'progress') {
+              setModelFiles(prev => ({
+                ...prev,
+                [data.file]: {
+                  progress: data.progress,
+                  loaded: data.loaded,
+                  total: data.total
+                }
+              }));
+              setQueue(prev => prev.map(qItem => 
+                qItem.id === item.id 
+                  ? { ...qItem, status: 'model_loading', progressDetails: 'Descargando modelo local en navegador...' }
+                  : qItem
+              ));
+            } else if (data.status === 'ready') {
+              setQueue(prev => prev.map(qItem => 
+                qItem.id === item.id 
+                  ? { ...qItem, progressDetails: 'Modelo cargado. Traduciendo...' }
+                  : qItem
+              ));
+            }
           }
-        }
-      });
+        });
 
-      setTranslatedBlob(resultBlob);
-      const nameParts = file.name.split('.');
-      const ext = nameParts.pop();
-      const newName = `${nameParts.join('.')}_[${tgtLang.toUpperCase()}].${ext}`;
-      setDownloadName(newName);
-      setStatus('completed');
+        const nameParts = item.file.name.split('.');
+        const ext = nameParts.pop();
+        const newName = `${nameParts.join('.')}_[${tgtLang.toUpperCase()}].${ext}`;
 
-      // Add to history
-      const newHistoryItem = {
-        id: Date.now(),
-        fileName: file.name,
-        translatedName: newName,
-        srcLang,
-        tgtLang,
-        provider: provider === 'ollama' ? `Ollama (${selectedOllamaModel})` : selectedProvider.name,
-        date: new Date().toLocaleDateString()
-      };
-      const updatedHistory = [newHistoryItem, ...history.slice(0, 4)];
-      setHistory(updatedHistory);
-      localStorage.setItem('docx_translator_history', JSON.stringify(updatedHistory));
+        // Update item state to completed
+        setQueue(prev => prev.map(qItem => 
+          qItem.id === item.id 
+            ? { ...qItem, status: 'completed', progressPercent: 100, progressDetails: 'Completado', translatedBlob: resultBlob, downloadName: newName }
+            : qItem
+        ));
 
-    } catch (err) {
-      console.error(err);
-      setStatus('error');
-      setErrorMsg(err.message || 'Ocurrió un error inesperado durante la traducción.');
+        // Add to history
+        const newHistoryItem = {
+          id: Date.now() + Math.random(),
+          fileName: item.file.name,
+          translatedName: newName,
+          srcLang,
+          tgtLang,
+          provider: provider === 'ollama' ? `Ollama (${selectedOllamaModel})` : selectedProvider.name,
+          date: new Date().toLocaleDateString()
+        };
+        setHistory(prev => {
+          const updated = [newHistoryItem, ...prev.slice(0, 4)];
+          localStorage.setItem('docx_translator_history', JSON.stringify(updated));
+          return updated;
+        });
+
+      } catch (err) {
+        console.error(err);
+        setQueue(prev => prev.map(qItem => 
+          qItem.id === item.id 
+            ? { ...qItem, status: 'error', errorMsg: err.message || 'Error inesperado durante la traducción.', progressDetails: 'Error' }
+            : qItem
+        ));
+      }
     }
+
+    setIsTranslatingAll(false);
+    setStatus('completed');
   };
 
-  const triggerDownload = () => {
-    if (!translatedBlob) return;
-    const url = URL.createObjectURL(translatedBlob);
+  const triggerDownloadItem = (item) => {
+    if (!item.translatedBlob) return;
+    const url = URL.createObjectURL(item.translatedBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = downloadName;
+    a.download = item.downloadName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
+  const triggerDownloadAll = () => {
+    queue.forEach(item => {
+      if (item.status === 'completed') {
+        triggerDownloadItem(item);
+      }
+    });
+  };
+
   const handleReset = () => {
-    setFile(null);
+    setQueue([]);
     setStatus('idle');
-    setTranslatedBlob(null);
     setErrorMsg('');
-    setProgressPercent(0);
-    setProgressDetails('');
     setModelFiles({});
   };
 
@@ -516,9 +586,9 @@ export default function App() {
               </div>
             </div>
 
-            {/* Drag Zone */}
-            <div className={`workspace-container ${isDragActive ? 'drag-active' : ''}`}>
-              {status === 'idle' && (
+            {/* Drag Zone & Queue */}
+            <div className={`workspace-container ${isDragActive ? 'drag-active' : ''}`} style={{ justifyContent: queue.length > 0 ? 'flex-start' : 'center', minHeight: queue.length > 0 ? 'auto' : '360px' }}>
+              {queue.length === 0 ? (
                 <div 
                   onDragEnter={handleDrag}
                   onDragOver={handleDrag}
@@ -530,6 +600,7 @@ export default function App() {
                     type="file"
                     id="docx-file-input-main"
                     accept=".docx"
+                    multiple
                     onChange={handleFileChange}
                     style={{ display: 'none' }}
                   />
@@ -537,124 +608,174 @@ export default function App() {
                     <div className="icon-wrapper-large">
                       <Upload size={28} />
                     </div>
-                    {file ? (
-                      <div style={{ textAlign: 'center' }}>
-                        <span className="file-pill">
-                          <FileText size={16} />
-                          {file.name}
-                        </span>
-                        <div className="dropzone-subtitle" style={{ marginTop: '8px' }}>
-                          {(file.size / (1024*1024)).toFixed(2)} MB
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        <span className="dropzone-title">Arrastra tu documento de Word aquí</span>
-                        <span className="dropzone-subtitle">o haz clic para explorar tus archivos (formato .docx)</span>
-                      </div>
-                    )}
+                    <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <span className="dropzone-title">Arrastra tus documentos de Word aquí</span>
+                      <span className="dropzone-subtitle">o haz clic para explorar tus archivos (puedes subir varios .docx)</span>
+                    </div>
                   </label>
                 </div>
-              )}
-
-              {/* Progress Stepper */}
-              {(status === 'preparing' || status === 'model_loading' || status === 'translating') && (
-                <div className="progress-section">
-                  <div className="progress-icon animate-pulse">
-                    <Cpu size={24} />
-                  </div>
-                  <div style={{ textAlign: 'center' }}>
-                    <div className="progress-title">
-                      {status === 'model_loading' ? 'Inicializando Modelo...' : 'Traduciendo Documento'}
-                    </div>
-                    <div className="progress-desc" style={{ marginTop: '4px' }}>{progressDetails}</div>
+              ) : (
+                <div className="queue-container">
+                  <div className="queue-header">
+                    <span className="queue-title">Cola de Documentos</span>
+                    <span className="queue-count">{queue.length} {queue.length === 1 ? 'archivo' : 'archivos'}</span>
                   </div>
 
-                  <div className="progress-bar-wrapper">
-                    <div className="progress-track">
-                      <div 
-                        className="progress-fill" 
-                        style={{ width: `${status === 'model_loading' ? modelStats.percent : progressPercent}%` }}
-                      ></div>
-                    </div>
-                    <div className="progress-percentage">
-                      {status === 'model_loading' ? `${modelStats.percent}%` : `${progressPercent}%`}
-                    </div>
+                  <div className="queue-list">
+                    {queue.map((item) => {
+                      const isActive = item.status === 'preparing' || item.status === 'model_loading' || item.status === 'translating';
+                      return (
+                        <div key={item.id} className={`queue-item ${isActive ? 'active' : ''}`}>
+                          <div className="queue-item-main">
+                            <div className="queue-item-details">
+                              <span className="queue-item-name" title={item.file.name}>{item.file.name}</span>
+                              <span className="queue-item-meta">
+                                {(item.file.size / (1024*1024)).toFixed(2)} MB • {item.progressDetails}
+                              </span>
+                            </div>
+
+                            <div className="queue-item-actions">
+                              {item.status === 'pending' && (
+                                <span className="queue-badge pending">Espera</span>
+                              )}
+                              {isActive && (
+                                <span className="queue-badge translating animate-pulse">
+                                  {item.status === 'model_loading' ? 'IA' : `${item.progressPercent}%`}
+                                </span>
+                              )}
+                              {item.status === 'completed' && (
+                                <>
+                                  <span className="queue-badge completed">Listo</span>
+                                  <button
+                                    onClick={() => triggerDownloadItem(item)}
+                                    className="queue-btn-action queue-btn-download"
+                                    title="Descargar archivo traducido"
+                                  >
+                                    <Download size={14} />
+                                  </button>
+                                </>
+                              )}
+                              {item.status === 'error' && (
+                                <>
+                                  <span className="queue-badge error" title={item.errorMsg}>Error</span>
+                                  <div className="alert-circle-btn" title={item.errorMsg} style={{ color: 'var(--error-color)', display: 'flex', alignItems: 'center' }}>
+                                    <AlertCircle size={14} />
+                                  </div>
+                                </>
+                              )}
+                              
+                              <button
+                                onClick={() => handleRemoveFromQueue(item.id)}
+                                disabled={isTranslatingAll}
+                                className="queue-btn-action queue-btn-delete"
+                                title="Eliminar de la cola"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          </div>
+
+                          {isActive && item.status !== 'model_loading' && (
+                            <div className="queue-item-progress">
+                              <div className="progress-track" style={{ height: '6px' }}>
+                                <div 
+                                  className="progress-fill" 
+                                  style={{ width: `${item.progressPercent}%` }}
+                                ></div>
+                              </div>
+                            </div>
+                          )}
+
+                          {item.status === 'model_loading' && (
+                            <div className="queue-item-progress">
+                              <div className="progress-track" style={{ height: '6px' }}>
+                                <div 
+                                  className="progress-fill" 
+                                  style={{ width: `${modelStats.percent}%` }}
+                                ></div>
+                              </div>
+                              <span className="queue-item-progress-text">{modelStats.text}</span>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
 
-                  {status === 'model_loading' && (
-                    <div className="info-box" style={{ width: '100%', fontSize: '0.7rem', padding: '10px' }}>
-                      <strong style={{color: '#a78bfa'}}>{modelStats.text}</strong>
-                      <p style={{marginTop: '4px', fontSize: '0.65rem', color: '#64748b'}}>
-                        Esto solo ocurre la primera vez y almacena el modelo localmente en el navegador.
-                      </p>
+                  {!isTranslatingAll && (
+                    <div 
+                      onDragEnter={handleDrag}
+                      onDragOver={handleDrag}
+                      onDragLeave={handleDrag}
+                      onDrop={handleDrop}
+                      className="queue-mini-dropzone"
+                    >
+                      <input
+                        type="file"
+                        id="docx-file-input-mini"
+                        accept=".docx"
+                        multiple
+                        onChange={handleFileChange}
+                        style={{ display: 'none' }}
+                      />
+                      <label htmlFor="docx-file-input-mini" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                        <Upload size={14} style={{ color: 'var(--primary-color)' }} />
+                        <span>Arrastra más archivos o haz clic aquí para añadir</span>
+                      </label>
                     </div>
                   )}
-                </div>
-              )}
 
-              {/* Completed Screen */}
-              {status === 'completed' && (
-                <div className="success-screen">
-                  <div className="success-icon">
-                    <CheckCircle2 size={32} />
-                  </div>
-                  <div>
-                    <h3 className="success-title">¡Traducción completada!</h3>
-                    <p className="success-subtitle" style={{ marginTop: '4px' }}>
-                      Se ha generado la versión traducida del documento respetando el diseño original.
-                    </p>
-                    <div style={{ display: 'flex', justifyContent: 'center', marginTop: '12px' }}>
-                      <span className="file-result-badge">{downloadName}</span>
-                    </div>
-                  </div>
-
-                  <div className="btn-row">
-                    <button onClick={triggerDownload} className="btn-download">
-                      <Download size={14} />
-                      Descargar archivo
-                    </button>
-                    <button onClick={handleReset} className="btn-reset">
-                      Traducir otro
+                  <div className="queue-actions-footer">
+                    {queue.some(q => q.status === 'completed') && (
+                      <button
+                        onClick={triggerDownloadAll}
+                        className="btn-reset"
+                        style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
+                      >
+                        <Download size={14} />
+                        <span>Descargar todos</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={handleClearQueue}
+                      disabled={isTranslatingAll}
+                      className="btn-reset"
+                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
+                    >
+                      <Trash2 size={14} />
+                      <span>Limpiar cola</span>
                     </button>
                   </div>
-                </div>
-              )}
-
-              {/* Error Screen */}
-              {status === 'error' && (
-                <div className="success-screen" style={{ gap: '16px' }}>
-                  <div className="success-icon" style={{ backgroundColor: 'rgba(239,68,68,0.1)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.2)' }}>
-                    <AlertCircle size={32} />
-                  </div>
-                  <div>
-                    <h3 className="success-title" style={{ color: '#ef4444' }}>Ocurrió un error</h3>
-                    <p className="success-subtitle" style={{ marginTop: '4px' }}>{errorMsg}</p>
-                  </div>
-                  <button onClick={handleReset} className="btn-reset">
-                    Reintentar
-                  </button>
                 </div>
               )}
             </div>
 
             {/* Error config messages */}
-            {errorMsg && status === 'idle' && (
+            {errorMsg && (
               <div className="alert-box alert-danger">
                 <AlertCircle size={14} style={{ marginTop: '2px' }} />
                 <span>{errorMsg}</span>
               </div>
             )}
 
-            {/* Translate Button */}
-            {status === 'idle' && (
+            {/* Action Buttons */}
+            {queue.length > 0 && (
               <button
                 onClick={handleTranslate}
-                disabled={!file}
+                disabled={isTranslatingAll || !queue.some(q => q.status === 'pending' || q.status === 'error')}
                 className="btn-translate glow-primary"
               >
-                <Cpu size={16} />
-                Comenzar Traducción
+                {isTranslatingAll ? (
+                  <>
+                    <RefreshCw size={16} className="animate-spin" />
+                    <span>Traduciendo Cola...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play size={16} />
+                    <span>Comenzar Traducción de la Cola</span>
+                  </>
+                )}
               </button>
             )}
           </div>
