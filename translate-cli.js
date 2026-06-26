@@ -31,6 +31,12 @@ const ollamaUrl = args.url || 'http://192.168.50.216:11434';
 const inputDir = args.input || './input';
 const outputDir = args.output || './output';
 
+// Robustness parameters
+const maxRetries = parseInt(args.retries, 10) || 5;
+const requestTimeoutMs = (parseInt(args.timeout, 10) || 120) * 1000;
+const requestDelayMs = parseInt(args.delay, 10) || 200;
+const maxConsecutiveErrors = parseInt(args.consecutive, 10) || 5;
+
 console.log('=== TRADUCTOR DE DOCX POR LÍNEA DE COMANDOS ===');
 console.log(`Idioma Origen:      ${srcLang}`);
 console.log(`Idioma Destino:     ${tgtLang}`);
@@ -38,6 +44,10 @@ console.log(`Modelo Ollama:      ${modelName}`);
 console.log(`Servidor Ollama:    ${ollamaUrl}`);
 console.log(`Carpeta Entrada:    ${inputDir}`);
 console.log(`Carpeta Salida:     ${outputDir}`);
+console.log(`Intentos (Retries):  ${maxRetries}`);
+console.log(`Timeout por lote:   ${requestTimeoutMs / 1000}s`);
+console.log(`Pausa entre lotes:  ${requestDelayMs}ms`);
+console.log(`Errores consec.:    ${maxConsecutiveErrors}`);
 console.log('================================================\n');
 
 // Helper to chunk array
@@ -73,6 +83,8 @@ function cleanAndParseJSON(str) {
   }
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // Translate batch via Ollama
 async function translateOllamaBatch(texts, src, tgt, model, url) {
   const itemsToTranslate = [];
@@ -89,6 +101,7 @@ async function translateOllamaBatch(texts, src, tgt, model, url) {
   if (itemsToTranslate.length === 0) return resultTemplate;
 
   const chunks = chunkArray(itemsToTranslate, 15);
+  let consecutiveErrors = 0;
   
   for (let cIdx = 0; cIdx < chunks.length; cIdx++) {
     const chunk = chunks[cIdx];
@@ -108,42 +121,72 @@ Example output:
   "translations": ["translated text 1", "translated text 2"]
 }`;
 
-    try {
-      const response = await fetch(`${url}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: JSON.stringify(chunkTexts) }
-          ],
-          format: 'json',
-          stream: false,
-          options: { temperature: 0.1 }
-        })
-      });
+    let success = false;
+    let translatedChunk = null;
+    let attempt = 0;
 
-      if (!response.ok) {
-        throw new Error(`Error API Ollama: ${response.status} - ${await response.text()}`);
+    while (attempt < maxRetries && !success) {
+      attempt++;
+      try {
+        if (requestDelayMs > 0 && (cIdx > 0 || attempt > 1)) {
+          await sleep(requestDelayMs);
+        }
+
+        const response = await fetch(`${url}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: JSON.stringify(chunkTexts) }
+            ],
+            format: 'json',
+            stream: false,
+            options: { temperature: 0.1 }
+          }),
+          signal: AbortSignal.timeout(requestTimeoutMs)
+        });
+
+        if (!response.ok) {
+          throw new Error(`Error API Ollama: ${response.status} - ${await response.text()}`);
+        }
+
+        const resData = await response.json();
+        const content = resData.message?.content;
+        if (!content) throw new Error('Respuesta vacía del modelo Ollama');
+
+        const parsed = cleanAndParseJSON(content);
+        translatedChunk = Array.isArray(parsed) ? parsed : (parsed.translations || Object.values(parsed)[0]);
+
+        if (!Array.isArray(translatedChunk)) {
+          throw new Error('El modelo de Ollama no devolvió un array de traducciones válido');
+        }
+
+        success = true;
+      } catch (error) {
+        console.error(`  -> [Intento ${attempt}/${maxRetries}] Error traduciendo lote ${cIdx + 1}/${chunks.length}:`, error.message);
+        if (attempt < maxRetries) {
+          const backoff = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
+          console.log(`     Esperando ${backoff}ms antes de reintentar...`);
+          await sleep(backoff);
+        }
       }
+    }
 
-      const resData = await response.json();
-      const content = resData.message?.content;
-      if (!content) throw new Error('Respuesta vacía del modelo Ollama');
-
-      const parsed = cleanAndParseJSON(content);
-      const translatedChunk = Array.isArray(parsed) ? parsed : (parsed.translations || Object.values(parsed)[0]);
-
-      if (!Array.isArray(translatedChunk)) {
-        throw new Error('El modelo de Ollama no devolvió un array de traducciones válido');
-      }
-
+    if (success && translatedChunk) {
+      consecutiveErrors = 0;
       chunk.forEach((item, idx) => {
         resultTemplate[item.index] = translatedChunk[idx] || item.text;
       });
-    } catch (error) {
-      console.error(`  -> Error traduciendo lote ${cIdx + 1}/${chunks.length}:`, error.message);
+    } else {
+      consecutiveErrors++;
+      console.error(`  -> Lote ${cIdx + 1}/${chunks.length} falló definitivamente tras ${maxRetries} intentos.`);
+      
+      if (consecutiveErrors >= maxConsecutiveErrors) {
+        throw new Error(`Se ha alcanzado el límite de ${maxConsecutiveErrors} errores consecutivos. Abortando traducción del documento.`);
+      }
+
       // Fallback: keep original text for this chunk if it failed
       chunk.forEach(item => {
         resultTemplate[item.index] = item.text;
