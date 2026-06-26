@@ -101,7 +101,12 @@ export async function translateDocxFile({
     mapping.forEach((map, index) => {
       const fileInfo = parsedFiles[map.fileIdx];
       const element = fileInfo.textElements[map.elIdx];
-      const translatedText = translatedStrings[index];
+      let translatedText = translatedStrings[index];
+      
+      // Fallback to original text if translation is missing or not a string
+      if (typeof translatedText !== 'string') {
+        translatedText = stringsToTranslate[index] || '';
+      }
       
       // Preserve spaces inside Word xml using xml:space="preserve" if necessary,
       // or we can keep the existing attribute if it was present
